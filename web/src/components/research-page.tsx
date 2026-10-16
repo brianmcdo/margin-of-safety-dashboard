@@ -520,7 +520,7 @@ function RankedTable({
             <AlertDescription>Widen a slider or clear a signal checkbox.</AlertDescription>
           </Alert>
         ) : (
-          <div className="max-h-[28rem] overflow-auto">
+          <div className="max-h-112 overflow-auto">
             <Table>
               <TableHeader>
                 <TableRow>

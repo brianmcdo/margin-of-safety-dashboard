@@ -77,6 +77,8 @@ The terminal shows the names that clear the filters, then a suggested basket. Th
 
 The page in `web/` is a [shadcn/ui](https://ui.shadcn.com/) app (Vite, React, and Tailwind). Docker builds that page into the image. Locally, `python -m src.api` serves the last `npm run build`.
 
+![Research tab of the dashboard, with filters, ranked names, a suggested basket, and the selected stock.](dashboard.png)
+
 Two tabs:
 
 - **Research** loads the latest saved snapshot. Filters for margin of safety, quality, market cap, sector, signal, commodity producers, and low-cost producers apply to the charts, the ranked table, and the CSV. A row opens the stock: reasons, valuation methods, a headline warning, and the commodity grid. Oil, gold, and copper planning prices on that card reprice the grid from cached statements. They do not start a fetch. The suggested basket sits under the table and uses the filtered ranking. **Run a scan** in the filter column writes a new snapshot. A limit of `0` means the whole selected universe.
