@@ -7,6 +7,7 @@ __pycache__/
 .streamlit/secrets.toml
 data/*.db
 data/*.db-*
+logs/
 output/*.csv
 output/*.json
 *.egg-info/

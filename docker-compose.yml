@@ -1,3 +1,9 @@
+# docker compose up --build
+# Dashboard: http://localhost:8501
+# A scan uses the same image and config.yaml:
+#   docker compose run --rm scan
+#   docker compose run --rm scan --universe INTC,XOM,NEM --limit 3
+
 services:
   dashboard:
     build: .
@@ -6,9 +12,14 @@ services:
     volumes:
       - ./data:/app/data
       - ./output:/app/output
+      - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro
     environment:
       FMP_API_KEY: ${FMP_API_KEY:-}
+      ALERT_EMAIL_FROM: ${ALERT_EMAIL_FROM:-}
+      ALERT_EMAIL_PASSWORD: ${ALERT_EMAIL_PASSWORD:-}
+      ALERT_EMAIL_USER: ${ALERT_EMAIL_USER:-}
+    restart: unless-stopped
 
   scan:
     build: .
@@ -16,7 +27,12 @@ services:
     volumes:
       - ./data:/app/data
       - ./output:/app/output
+      - ./logs:/app/logs
       - ./config.yaml:/app/config.yaml:ro
     environment:
       FMP_API_KEY: ${FMP_API_KEY:-}
-    command: python -m src.main --universe sample --min-mos 0.25
+      ALERT_EMAIL_FROM: ${ALERT_EMAIL_FROM:-}
+      ALERT_EMAIL_PASSWORD: ${ALERT_EMAIL_PASSWORD:-}
+      ALERT_EMAIL_USER: ${ALERT_EMAIL_USER:-}
+    entrypoint: ["python", "-m", "src.main"]
+    command: []

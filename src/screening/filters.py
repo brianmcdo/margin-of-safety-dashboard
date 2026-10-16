@@ -39,6 +39,7 @@ class ComputedMetrics:
     pb_percentile: float | None = None
     pe_percentile: float | None = None
     ev_ebit_percentile: float | None = None
+    peer_group: str | None = None
 
 
 @dataclass
@@ -85,7 +86,9 @@ def compute_metrics(stock: StockFundamentals, settings: Settings) -> ComputedMet
         enterprise / ebit if enterprise is not None and ebit is not None and ebit > 0 else None
     )
 
-    ncav = ncav_per_share(stock.current_assets, stock.total_liabilities, stock.shares_outstanding)
+    ncav, _ncav_note = ncav_per_share(
+        stock.current_assets, stock.total_liabilities, stock.shares_outstanding
+    )
     strict, _note = strict_ncav_per_share(
         stock.current_assets,
         stock.cash,
@@ -121,46 +124,81 @@ def compute_metrics(stock: StockFundamentals, settings: Settings) -> ComputedMet
     )
 
 
-def _percentile(value: float, sample: list[float]) -> float | None:
+_MIN_PEER_GROUP = 5
+
+
+def _percentile(value: float | None, sample: list[float]) -> float | None:
     """0 means cheapest (lowest multiple). None when the sample is too small."""
     others = [item for item in sample if item is not None]
-    if value is None or len(others) < 5:
+    if value is None or len(others) < _MIN_PEER_GROUP:
         return None
     below = sum(1 for item in others if item < value)
     return below / (len(others) - 1)
+
+
+def _group_label(value: str | None) -> str:
+    return (value or "").strip()
 
 
 def attach_peer_percentiles(
     metrics_by_ticker: dict[str, ComputedMetrics],
     stocks: list[StockFundamentals],
 ) -> None:
-    """Fill universe and sector percentiles in place."""
-    pe_sample = [item.pe for item in metrics_by_ticker.values() if item.pe is not None]
-    pb_sample = [item.pb for item in metrics_by_ticker.values() if item.pb is not None]
-    ev_sample = [item.ev_ebit for item in metrics_by_ticker.values() if item.ev_ebit is not None]
-    sector_pe: dict[str, list[float]] = {}
+    """Rank P/E, P/B, and EV/EBIT inside the sector, or the industry if the sector is thin.
+
+    A group needs at least five names. The whole universe is not a peer set.
+    ``pe_sector_percentile`` stays a sector-only figure for the P/E screen.
+    """
+    sector_members: dict[str, list[str]] = {}
+    industry_members: dict[str, list[str]] = {}
     for stock in stocks:
-        metrics = metrics_by_ticker.get(stock.ticker)
-        if metrics is None or metrics.pe is None:
+        if stock.ticker not in metrics_by_ticker:
             continue
-        sector_pe.setdefault(stock.sector or "Unknown", []).append(metrics.pe)
+        sector = _group_label(stock.sector)
+        industry = _group_label(stock.industry)
+        if sector:
+            sector_members.setdefault(sector, []).append(stock.ticker)
+        if industry:
+            industry_members.setdefault(industry, []).append(stock.ticker)
+
+    def _sample(tickers: list[str], attr: str) -> list[float]:
+        values: list[float] = []
+        for ticker in tickers:
+            metrics = metrics_by_ticker.get(ticker)
+            if metrics is None:
+                continue
+            value = getattr(metrics, attr)
+            if value is not None:
+                values.append(value)
+        return values
 
     for stock in stocks:
         metrics = metrics_by_ticker.get(stock.ticker)
         if metrics is None:
             continue
+        sector = _group_label(stock.sector)
+        industry = _group_label(stock.industry)
+        sector_tickers = sector_members.get(sector, [])
+        industry_tickers = industry_members.get(industry, [])
+        if len(sector_tickers) >= _MIN_PEER_GROUP:
+            peers = sector_tickers
+            metrics.peer_group = "sector"
+        elif len(industry_tickers) >= _MIN_PEER_GROUP:
+            peers = industry_tickers
+            metrics.peer_group = "industry"
+        else:
+            peers = []
+            metrics.peer_group = None
+        if metrics.pe is not None and sector_tickers:
+            metrics.pe_sector_percentile = _percentile(metrics.pe, _sample(sector_tickers, "pe"))
+        if not peers:
+            continue
         if metrics.pe is not None:
-            metrics.pe_percentile = _percentile(metrics.pe, [v for v in pe_sample if v is not None])
-            metrics.pe_sector_percentile = _percentile(
-                metrics.pe,
-                sector_pe.get(stock.sector or "Unknown", []),
-            )
+            metrics.pe_percentile = _percentile(metrics.pe, _sample(peers, "pe"))
         if metrics.pb is not None:
-            metrics.pb_percentile = _percentile(metrics.pb, [v for v in pb_sample if v is not None])
+            metrics.pb_percentile = _percentile(metrics.pb, _sample(peers, "pb"))
         if metrics.ev_ebit is not None:
-            metrics.ev_ebit_percentile = _percentile(
-                metrics.ev_ebit, [v for v in ev_sample if v is not None]
-            )
+            metrics.ev_ebit_percentile = _percentile(metrics.ev_ebit, _sample(peers, "ev_ebit"))
 
 
 def _fail(failures: list[tuple[str, str]], code: str, message: str) -> None:

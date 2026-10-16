@@ -5,17 +5,57 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import Callable
+from pathlib import Path
 
-from src.config import Settings
+from src.config import Settings, resolve_path
 from src.data.cache import SnapshotStore
 from src.data.fetcher import fetch_aaa_yield, fetch_universe, resolve_universe
-from src.data.models import FetchFailure, PipelineResult, StockFundamentals, utcnow
+from src.data.models import FetchFailure, PipelineResult, SignalRecord, StockFundamentals, utcnow
 from src.screening.filters import attach_peer_percentiles, compute_metrics, screen_stock
 from src.signals.alerts import emit_alerts
 from src.signals.generator import build_record
 
 logger = logging.getLogger(__name__)
 Progress = Callable[[int, int, str], None]
+
+
+def evaluate_stocks(
+    stocks: list[StockFundamentals],
+    settings: Settings,
+    aaa_yield: float,
+) -> tuple[list[SignalRecord], list[FetchFailure]]:
+    """Value a prepared list. Nothing is fetched and nothing is stored."""
+    failures: list[FetchFailure] = []
+    usable: list[StockFundamentals] = []
+    for stock in stocks:
+        if stock.price is None or stock.price <= 0:
+            failures.append(FetchFailure(ticker=stock.ticker, error="no positive price"))
+            continue
+        usable.append(stock)
+
+    metrics = {}
+    valued: list[StockFundamentals] = []
+    for stock in usable:
+        try:
+            metrics[stock.ticker] = compute_metrics(stock, settings)
+        except Exception:
+            logger.exception("Could not compute metrics for %s; the rest of the universe continues", stock.ticker)
+            failures.append(FetchFailure(ticker=stock.ticker, error="metrics failed"))
+            continue
+        valued.append(stock)
+    try:
+        attach_peer_percentiles(metrics, valued)
+    except Exception:
+        logger.exception("Peer percentiles failed; ranking continues without them")
+    records: list[SignalRecord] = []
+    for stock in valued:
+        try:
+            screen = screen_stock(stock, metrics[stock.ticker], settings)
+            records.append(build_record(stock, screen, settings, aaa_yield))
+        except Exception as exc:
+            logger.exception("Could not value %s; the rest of the universe continues", stock.ticker)
+            failures.append(FetchFailure(ticker=stock.ticker, error=f"valuation failed: {exc}"))
+    return records, failures
 
 
 def run_pipeline(
@@ -61,19 +101,8 @@ def run_pipeline(
         stocks = list(fundamentals)
 
     yield_percent = aaa_yield if aaa_yield is not None else fetch_aaa_yield(settings, database)
-    usable: list[StockFundamentals] = []
-    for stock in stocks:
-        if stock.price is None or stock.price <= 0:
-            failures.append(FetchFailure(ticker=stock.ticker, error="no positive price"))
-            continue
-        usable.append(stock)
-
-    metrics = {stock.ticker: compute_metrics(stock, settings) for stock in usable}
-    attach_peer_percentiles(metrics, usable)
-    records = [
-        build_record(stock, screen_stock(stock, metrics[stock.ticker], settings), settings, yield_percent)
-        for stock in usable
-    ]
+    records, eval_failures = evaluate_stocks(stocks, settings, yield_percent)
+    failures.extend(eval_failures)
     previous = database.latest_run()
     result = PipelineResult(
         run_id=utcnow().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8],
@@ -84,6 +113,7 @@ def run_pipeline(
         aaa_yield=yield_percent,
     )
     database.save_run(result)
+    result.new_strong_value = database.record_daily_snapshot(result)
     if previous is None:
         logger.info("First snapshot stored. New-candidate alerts start on the next run.")
     else:
@@ -103,7 +133,5 @@ def run_pipeline(
     return result
 
 
-def _sqlite_path(settings: Settings):
-    from src.config import resolve_path
-
+def _sqlite_path(settings: Settings) -> Path:
     return resolve_path(settings.data.sqlite_path)

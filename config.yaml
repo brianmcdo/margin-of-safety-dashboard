@@ -3,21 +3,75 @@
 # and it is not investment advice.
 
 universe:
+  # sample, sp500, a comma-separated list, or a path to a ticker file.
   default: sample
-  cache_ttl_hours: 20
+  # Skip a live fetch when this ticker was stored less than this many hours ago.
+  cache_ttl_hours: 24
   max_workers: 6
+  # Used when the universe is "sample". Leave this empty to use the built-in list.
+  sample:
+    - INTC
+    - PFE
+    - BMY
+    - VZ
+    - T
+    - BAC
+    - C
+    - WFC
+    - GM
+    - F
+    - HPQ
+    - IBM
+    - CVS
+    - KHC
+    - MO
+    - LYB
+    - DOW
+    - NUE
+    - AAPL
+    - MSFT
+    - JNJ
+    - KO
+    - PEP
+    - WMT
+    - XOM
+    - CVX
+    - COP
+    - EOG
+    - DVN
+    - SLB
+    - NEM
+    - GOLD
+    - FCX
+    - VALE
+    - BHP
+    - RIO
 
 fred:
   series: DAAA
   # Percent, not a decimal. 6.0 means a 6% AAA corporate yield.
   fallback_aaa_yield: 6.0
 
+logging:
+  # Console level. DEBUG, INFO, WARNING, or ERROR. --log-level overrides this.
+  level: INFO
+  file: logs/value_signals.log
+  # The file keeps more detail than the terminal.
+  file_level: DEBUG
+
 data:
-  # yfinance | fmp | auto (FMP when FMP_API_KEY is set, otherwise yfinance)
+  # yfinance | fmp | auto
+  # auto uses Financial Modeling Prep when an API key is available, otherwise Yahoo.
   source: yfinance
+  # Optional. Used only when FMP_API_KEY is unset. Prefer the environment
+  # variable so the key stays out of git.
+  fmp_api_key: ""
   fmp_api_key_env: FMP_API_KEY
   sqlite_path: data/value_signals.db
   request_timeout_seconds: 25
+  max_retries: 3
+  retry_backoff_seconds: 1.0
+  rate_limit_backoff_seconds: 8.0
 
 screens:
   enabled:
@@ -64,20 +118,39 @@ valuation:
     # Terminal value is scaled down when it would dominate the result.
     max_terminal_share: 0.65
     normalize_years: 3
+    # Low case slows growth and raises the discount by these spreads.
+    # High case does the opposite. The reported value is the base case.
+    growth_spread: 0.02
+    discount_spread: 0.02
   ncav:
     discount_receivables: 0.75
     discount_inventory: 0.50
   mos:
     strong: 0.40
-    moderate: 0.25
-    minimum: 0.25
+    moderate: 0.30
+    # Ranked names must clear this median margin of safety.
+    minimum: 0.30
 
 scoring:
   weights:
+    # Relative cheapness uses sector or universe percentiles when the
+    # sample is large enough, and absolute multiples otherwise.
     margin_of_safety: 0.50
     cheapness: 0.25
-    balance_sheet: 0.15
-    quality: 0.10
+    quality: 0.25
+    balance_sheet: 0
+  quality:
+    tax_rate: 0.21
+    # Median ROIC or ROE below this, across at least two years, is a low-return flag.
+    low_return_threshold: 0.08
+    min_return_years: 2
+    # Strong and Moderate labels require at least this quality score.
+    minimum: 40
+    altman_safe: 2.99
+    altman_distress: 1.81
+    f_weight: 0.40
+    distress_weight: 0.30
+    returns_weight: 0.30
 
 alerts:
   console: true
@@ -93,6 +166,14 @@ alerts:
 
 commodity:
   enabled: true
+  # Sector match covers Energy and Basic Materials. Industry keywords pick
+  # oil, gold, copper, or the generic metals index. Utilities and financials
+  # are excluded in code.
+  sector_keywords:
+    - energy
+    - basic materials
+    - materials
+    - mining
   industry_keywords:
     - oil & gas
     - oil
@@ -109,8 +190,52 @@ commodity:
     - iron
     - lithium
     - metals
+  # normalized is the planning price. reference is the price assumed to be
+  # embedded in trailing free cash flow. Cash flow is scaled by normalized / reference.
+  prices:
+    oil:
+      normalized: 70
+      reference: 80
+      unit: USD per barrel
+    gold:
+      normalized: 2000
+      reference: 2300
+      unit: USD per ounce
+    copper:
+      normalized: 4.0
+      reference: 4.2
+      unit: USD per pound
+    metals:
+      normalized: 1.0
+      reference: 1.0
+      unit: index versus reference cash flow
   sensitivity_price_multipliers: [0.70, 0.85, 1.00, 1.15, 1.30]
   sensitivity_discount_rates: [0.08, 0.10, 0.12]
+  # Low-cost is a research flag, not an all-in sustaining cost.
+  low_cost_min_quality: 60
+  low_cost_max_debt_equity: 0.50
+
+news:
+  # Recent Yahoo headlines. A severe word flags the name. Milder words need two headlines.
+  enabled: true
+  lookback_days: 14
+  max_headlines: 8
+  min_negative_headlines: 2
+  # Leave false to flag only. True subtracts penalty points from the composite score.
+  downrank: false
+  penalty: 8
+
+backtest:
+  # Shown next to the equal-weight universe when that ticker has stored closes.
+  benchmark: SPY
+  # A forward close counts only when it is this many days from the 6-month or 1-year date.
+  price_tolerance_days: 10
+
+portfolio:
+  # Shares of the suggested basket. 0.25 means one sector can be at most 25%.
+  max_sector_weight: 0.25
+  max_position_size: 0.10
+  min_holdings: 8
 
 schedule:
   day_of_week: mon-fri

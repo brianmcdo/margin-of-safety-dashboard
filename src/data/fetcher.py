@@ -22,6 +22,7 @@ from src.data.parse import (
     assemble_fundamentals,
     info_number,
     latest_line_item,
+    quality_statement_fields,
 )
 from src.data.universe import SAMPLE_UNIVERSE, normalize_ticker
 
@@ -39,14 +40,35 @@ def _redact(message: str) -> str:
     return re.sub(r"(apikey=)[^&\s]+", r"\1***", message, flags=re.IGNORECASE)
 
 
+def resolve_fmp_api_key(settings: Settings) -> str:
+    """Financial Modeling Prep key from the environment, then from config.yaml.
+
+    The environment variable named by ``data.fmp_api_key_env`` wins so a key
+    in the shell is not overwritten by a blank or stale config value. A value
+    in ``data.fmp_api_key`` is used only when that variable is unset or empty.
+    The key itself is never logged.
+    """
+    env_name = (settings.data.fmp_api_key_env or "FMP_API_KEY").strip()
+    from_env = os.environ.get(env_name, "").strip() if env_name else ""
+    if from_env:
+        return from_env
+    return settings.data.fmp_api_key.strip()
+
+
 def resolve_source(settings: Settings) -> str:
     """Pick yfinance or FMP. Missing FMP credentials fall back to yfinance."""
     source = settings.data.source.strip().lower()
-    has_fmp_key = bool(os.environ.get(settings.data.fmp_api_key_env))
+    has_fmp_key = bool(resolve_fmp_api_key(settings))
     if source == "auto":
-        return "fmp" if has_fmp_key else "yfinance"
+        chosen = "fmp" if has_fmp_key else "yfinance"
+        logger.info("Data source auto-selected: %s", chosen)
+        return chosen
     if source == "fmp" and not has_fmp_key:
-        logger.warning("FMP_API_KEY is not set; falling back to yfinance")
+        logger.warning(
+            "Financial Modeling Prep was requested but no API key is set "
+            "in $%s or data.fmp_api_key; falling back to yfinance",
+            settings.data.fmp_api_key_env or "FMP_API_KEY",
+        )
         return "yfinance"
     if source not in {"yfinance", "fmp"}:
         logger.warning("Unknown data source %s; using yfinance", source)
@@ -71,7 +93,8 @@ def resolve_universe(name: str, settings: Settings, store: SnapshotStore) -> tup
         return path.name, _dedupe(tickers)
     lowered = raw.lower()
     if lowered == "sample":
-        return "sample", list(SAMPLE_UNIVERSE)
+        configured = [normalize_ticker(str(ticker)) for ticker in settings.universe.sample if str(ticker).strip()]
+        return "sample", _dedupe(configured or list(SAMPLE_UNIVERSE))
     if lowered in {"sp500", "s&p500", "s&p 500"}:
         return "sp500", load_sp500(store, settings.data.request_timeout_seconds)
     tickers = [normalize_ticker(part) for part in raw.split(",") if part.strip()]
@@ -138,26 +161,47 @@ def fetch_aaa_yield(settings: Settings, store: SnapshotStore | None = None) -> f
     """
     cache_key = f"fred:{settings.fred.series}"
     if store is not None:
-        cached = store.get_meta(cache_key, ttl_hours=12)
+        cached = store.get_meta(cache_key, ttl_hours=24)
         cached_value = as_float(cached)
         if cached_value is not None and cached_value > 0:
+            logger.info("AAA corporate yield from cache: %.2f%%", cached_value)
             return cached_value
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={settings.fred.series}"
-    try:
-        # A short timeout: a missing yield should fall back, not stall the scan.
-        text = _http_get(url, min(8.0, settings.data.request_timeout_seconds))
-        yield_percent = _last_fred_value(text)
-    except Exception as exc:
+    yield_percent = _fetch_fred_yield(url, settings)
+    if yield_percent is None:
         logger.warning(
-            "FRED AAA yield unavailable (%s); using fallback %.2f%%",
-            _redact(str(exc)),
+            "FRED series %s is unavailable; using configured AAA yield %.2f%%",
+            settings.fred.series,
             settings.fred.fallback_aaa_yield,
         )
         return settings.fred.fallback_aaa_yield
     if store is not None:
         store.set_meta(cache_key, f"{yield_percent:.6f}")
-    logger.info("AAA corporate yield from FRED: %.2f%%", yield_percent)
+    logger.info("AAA corporate yield from FRED %s: %.2f%%", settings.fred.series, yield_percent)
     return yield_percent
+
+
+def _fetch_fred_yield(url: str, settings: Settings) -> float | None:
+    """Download one FRED CSV with retries. Returns None when every attempt fails."""
+    attempts = max(1, settings.data.max_retries)
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            # A short timeout: a missing yield should fall back, not stall the scan.
+            text = _http_get(url, min(8.0, settings.data.request_timeout_seconds))
+            return _last_fred_value(text)
+        except Exception as exc:
+            last_error = exc
+            logger.warning(
+                "FRED attempt %s/%s failed: %s",
+                attempt,
+                attempts,
+                _redact(str(exc)),
+            )
+            if attempt < attempts:
+                _sleep(_backoff_seconds(attempt, _is_rate_limit(exc), settings))
+    logger.error("FRED request failed after %s attempt(s): %s", attempts, _redact(str(last_error)))
+    return None
 
 
 def _last_fred_value(csv_text: str) -> float:
@@ -193,6 +237,13 @@ def fetch_universe(
     failures: list[FetchFailure] = []
     done = len(fresh)
     total = len(tickers)
+    logger.info(
+        "Fundamentals cache: %s ticker(s) fresh within %.0f hours, %s to fetch from %s",
+        len(fresh),
+        ttl,
+        len(needed),
+        source,
+    )
     if progress is not None:
         progress(done, total, "cache")
     if not needed:
@@ -212,9 +263,23 @@ def fetch_universe(
                 stock = future.result()
             except Exception as exc:
                 message = _redact(str(exc)) or exc.__class__.__name__
-                logger.warning("Failed to fetch %s: %s", ticker, message)
-                failures.append(FetchFailure(ticker=ticker, error=message))
+                stale = store.get_fundamentals(ticker, ttl, allow_expired=True)
+                if stale is not None:
+                    note = (
+                        f"live fetch failed ({message}); "
+                        f"used cached snapshot from {stale.fetched_at.isoformat()}"
+                    )
+                    logger.warning("%s: %s", ticker, note)
+                    fresh.append(stale.model_copy(update={"notes": [*stale.notes, note]}))
+                else:
+                    logger.error(
+                        "Failed to fetch %s and no cached snapshot is available: %s",
+                        ticker,
+                        message,
+                    )
+                    failures.append(FetchFailure(ticker=ticker, error=message))
             else:
+                _log_data_gaps(stock)
                 try:
                     store.save_fundamentals(stock)
                 except Exception:
@@ -227,17 +292,115 @@ def fetch_universe(
 
 
 def _fetch_with_retry(ticker: str, settings: Settings, source: str) -> StockFundamentals:
+    """Fetch one ticker, retrying rate limits, then trying the other source."""
+    try:
+        return _attempt_source(ticker, settings, source)
+    except Exception as primary_error:
+        alternate = _alternate_source(source, settings)
+        if alternate is None:
+            raise
+        logger.warning(
+            "%s failed from %s (%s); falling back to %s",
+            ticker,
+            source,
+            _redact(str(primary_error)),
+            alternate,
+        )
+        try:
+            return _attempt_source(ticker, settings, alternate)
+        except Exception as alternate_error:
+            logger.error(
+                "%s fallback %s also failed: %s",
+                ticker,
+                alternate,
+                _redact(str(alternate_error)),
+            )
+            raise RuntimeError(
+                f"{source} failed ({primary_error}); {alternate} failed ({alternate_error})"
+            ) from alternate_error
+
+
+def _attempt_source(ticker: str, settings: Settings, source: str) -> StockFundamentals:
+    attempts = max(1, settings.data.max_retries)
     last_error: Exception | None = None
-    for attempt in range(3):
+    for attempt in range(1, attempts + 1):
         try:
             if source == "fmp":
-                return fetch_fmp(ticker, settings)
-            return fetch_yfinance(ticker)
+                stock = fetch_fmp(ticker, settings)
+            else:
+                stock = fetch_yfinance(ticker)
+            if settings.news.enabled:
+                from src.news.sentiment import attach_headlines
+
+                stock = attach_headlines(stock, settings.news)
+            return stock
         except Exception as exc:
             last_error = exc
-            time.sleep(0.4 * (attempt + 1))
-    assert last_error is not None
+            rate_limited = _is_rate_limit(exc)
+            logger.warning(
+                "%s %s attempt %s/%s failed%s: %s",
+                source,
+                ticker,
+                attempt,
+                attempts,
+                " (rate limit)" if rate_limited else "",
+                _redact(str(exc)),
+            )
+            if attempt < attempts:
+                delay = _backoff_seconds(attempt, rate_limited, settings)
+                logger.info("Retrying %s in %.1fs", ticker, delay)
+                _sleep(delay)
+    if last_error is None:
+        raise RuntimeError(f"no fetch attempt ran for {ticker}")
     raise last_error
+
+
+def _alternate_source(source: str, settings: Settings) -> str | None:
+    if source == "yfinance" and resolve_fmp_api_key(settings):
+        return "fmp"
+    if source == "fmp":
+        return "yfinance"
+    return None
+
+
+def _is_rate_limit(exc: BaseException) -> bool:
+    name = exc.__class__.__name__.lower().replace("_", "")
+    if "ratelimit" in name:
+        return True
+    text = str(exc).lower()
+    return "429" in text or "too many requests" in text or "rate limit" in text
+
+
+def _backoff_seconds(attempt: int, rate_limited: bool, settings: Settings) -> float:
+    base = (
+        settings.data.rate_limit_backoff_seconds
+        if rate_limited
+        else settings.data.retry_backoff_seconds
+    )
+    return max(0.0, base) * (2 ** max(0, attempt - 1))
+
+
+def _sleep(seconds: float) -> None:
+    if seconds > 0:
+        time.sleep(seconds)
+
+
+_DATA_GAPS = (
+    ("trailing_eps", "EPS"),
+    ("book_value_per_share", "book value per share"),
+    ("free_cash_flow", "free cash flow"),
+    ("current_assets", "current assets"),
+    ("total_liabilities", "total liabilities"),
+    ("shares_outstanding", "shares outstanding"),
+)
+
+
+def _log_data_gaps(stock: StockFundamentals) -> None:
+    if stock.notes:
+        logger.warning("%s data notes: %s", stock.ticker, "; ".join(stock.notes))
+    missing = [label for attr, label in _DATA_GAPS if getattr(stock, attr) is None]
+    if missing:
+        logger.warning("%s is missing %s", stock.ticker, ", ".join(missing))
 
 
 def fetch_yfinance(ticker: str) -> StockFundamentals:
@@ -253,6 +416,8 @@ def fetch_yfinance(ticker: str) -> StockFundamentals:
         if isinstance(raw_info, dict):
             info = raw_info
     except Exception as exc:
+        if _is_rate_limit(exc):
+            raise
         notes.append(f"quote info unavailable: {exc.__class__.__name__}")
 
     price = info_number(info, "currentPrice", "regularMarketPrice")
@@ -262,7 +427,9 @@ def fetch_yfinance(ticker: str) -> StockFundamentals:
             price = as_float(fast.get("lastPrice") if hasattr(fast, "get") else None)
             if price is None:
                 price = as_float(getattr(fast, "last_price", None))
-        except Exception:
+        except Exception as exc:
+            if _is_rate_limit(exc):
+                raise
             price = None
     if price is None:
         try:
@@ -270,14 +437,16 @@ def fetch_yfinance(ticker: str) -> StockFundamentals:
             if history is not None and not history.empty and "Close" in history.columns:
                 price = as_float(history["Close"].iloc[-1])
                 notes.append("price taken from recent daily history")
-        except Exception:
+        except Exception as exc:
+            if _is_rate_limit(exc):
+                raise
             price = None
     if price is None or price <= 0:
         raise RuntimeError(f"no price returned for {symbol}")
 
-    balance = _safe_frame(lambda: client.balance_sheet, notes, "balance sheet")
-    income = _safe_frame(lambda: client.financials, notes, "income statement")
-    cashflow = _safe_frame(lambda: client.cashflow, notes, "cash flow statement")
+    balance = _safe_frame(lambda: client.balance_sheet, notes, "balance sheet", symbol)
+    income = _safe_frame(lambda: client.financials, notes, "income statement", symbol)
+    cashflow = _safe_frame(lambda: client.cashflow, notes, "cash flow statement", symbol)
     fcf_history = _free_cash_flow_history(cashflow)
     total_equity = latest_line_item(balance, LINE_ITEMS["equity"])
     shares = info_number(info, "sharesOutstanding", "impliedSharesOutstanding")
@@ -287,6 +456,10 @@ def fetch_yfinance(ticker: str) -> StockFundamentals:
     if free_cash_flow is None and fcf_history:
         free_cash_flow = fcf_history[0]
         notes.append("free cash flow fell back to the latest annual figure")
+    quality_fields = quality_statement_fields(balance, income, cashflow)
+    if total_equity is None:
+        total_equity = quality_fields.get("total_equity")
+    quality_fields.pop("total_equity", None)
 
     return assemble_fundamentals(
         ticker=symbol,
@@ -320,6 +493,7 @@ def fetch_yfinance(ticker: str) -> StockFundamentals:
         enterprise_value=info_number(info, "enterpriseValue"),
         source="yfinance",
         notes=notes,
+        **quality_fields,
     )
 
 
@@ -343,11 +517,20 @@ def _free_cash_flow_history(cashflow: pd.DataFrame | None) -> list[float]:
     return combined
 
 
-def _safe_frame(loader: Callable[[], Any], notes: list[str], label: str) -> pd.DataFrame | None:
+def _safe_frame(
+    loader: Callable[[], Any],
+    notes: list[str],
+    label: str,
+    ticker: str,
+) -> pd.DataFrame | None:
     try:
         frame = loader()
     except Exception as exc:
-        notes.append(f"{label} unavailable: {exc.__class__.__name__}")
+        if _is_rate_limit(exc):
+            raise
+        message = f"{label} unavailable: {exc.__class__.__name__}"
+        notes.append(message)
+        logger.warning("%s %s", ticker, message)
         return None
     if not isinstance(frame, pd.DataFrame):
         return None
@@ -363,17 +546,24 @@ def _text(info: dict[str, Any], *keys: str) -> str | None:
 
 
 def fetch_fmp(ticker: str, settings: Settings) -> StockFundamentals:
-    """Optional Financial Modeling Prep fetch. Requires FMP_API_KEY."""
+    """Optional Financial Modeling Prep fetch.
+
+    The key comes from the environment variable named in config, or from
+    ``data.fmp_api_key`` when that variable is empty.
+    """
     symbol = normalize_ticker(ticker)
-    api_key = os.environ.get(settings.data.fmp_api_key_env, "")
+    api_key = resolve_fmp_api_key(settings)
     if not api_key:
-        raise RuntimeError("FMP_API_KEY is not set")
+        env_name = settings.data.fmp_api_key_env or "FMP_API_KEY"
+        raise RuntimeError(f"No Financial Modeling Prep API key in ${env_name} or data.fmp_api_key")
     timeout = settings.data.request_timeout_seconds
     profile = _fmp_first(symbol, "profile", api_key, timeout)
     metrics = _fmp_first(symbol, "key-metrics-ttm", api_key, timeout)
-    balance = _fmp_first(symbol, "balance-sheet-statement", api_key, timeout, {"limit": 1})
-    income = _fmp_first(symbol, "income-statement", api_key, timeout, {"limit": 1})
+    balance_rows = _fmp_list(symbol, "balance-sheet-statement", api_key, timeout, {"limit": 4})
+    income_rows = _fmp_list(symbol, "income-statement", api_key, timeout, {"limit": 4})
     cash_rows = _fmp_list(symbol, "cash-flow-statement", api_key, timeout, {"limit": 4})
+    balance = balance_rows[0] if balance_rows else {}
+    income = income_rows[0] if income_rows else {}
     price = _first_number(profile, "price")
     if price is None or price <= 0:
         raise RuntimeError(f"FMP returned no price for {symbol}")
@@ -418,6 +608,27 @@ def fetch_fmp(ticker: str, settings: Settings) -> StockFundamentals:
         average_volume=_first_number(profile, "volAvg"),
         enterprise_value=_first_number(metrics, "enterpriseValueTTM"),
         source="fmp",
+        net_income=_first_number(income, "netIncome"),
+        total_assets=_first_number(balance, "totalAssets"),
+        retained_earnings=_first_number(balance, "retainedEarnings"),
+        operating_cash_flow=_column_first(cash_rows, "operatingCashFlow"),
+        gross_profit=_first_number(income, "grossProfit"),
+        long_term_debt=_first_number(balance, "longTermDebt"),
+        net_income_history=_column(income_rows, "netIncome"),
+        total_assets_history=_column(balance_rows, "totalAssets"),
+        operating_cash_flow_history=_column(cash_rows, "operatingCashFlow"),
+        revenue_history=_column(income_rows, "revenue"),
+        ebit_history=_column(income_rows, "ebit", "operatingIncome"),
+        gross_profit_history=_column(income_rows, "grossProfit"),
+        long_term_debt_history=_column(balance_rows, "longTermDebt"),
+        total_debt_history=_column(balance_rows, "totalDebt"),
+        cash_history=_column(balance_rows, "cashAndCashEquivalents", "cashAndShortTermInvestments"),
+        equity_history=_column(balance_rows, "totalStockholdersEquity"),
+        shares_history=_column(income_rows, "weightedAverageShsOutDil"),
+        current_ratio_history=_ratio_history(
+            _column(balance_rows, "totalCurrentAssets"),
+            _column(balance_rows, "totalCurrentLiabilities"),
+        ),
     )
 
 
@@ -441,11 +652,17 @@ def _fmp_list(
         headers={"User-Agent": USER_AGENT},
         timeout=timeout,
     )
+    if response.status_code == 429:
+        retry_after = response.headers.get("Retry-After", "").strip()
+        detail = f", retry after {retry_after}s" if retry_after else ""
+        raise RuntimeError(f"FMP rate limit (429){detail}")
     response.raise_for_status()
     payload = response.json()
     if isinstance(payload, dict):
-        message = payload.get("Error Message") or payload.get("error") or "unexpected FMP payload"
-        raise RuntimeError(str(message))
+        message = str(payload.get("Error Message") or payload.get("error") or "unexpected FMP payload")
+        if "limit" in message.lower():
+            raise RuntimeError(f"FMP rate limit: {message}")
+        raise RuntimeError(message)
     if not isinstance(payload, list):
         raise RuntimeError("unexpected FMP payload")
     return [row for row in payload if isinstance(row, dict)]
@@ -460,6 +677,35 @@ def _fmp_first(
 ) -> dict[str, Any]:
     rows = _fmp_list(symbol, endpoint, api_key, timeout, extra)
     return rows[0] if rows else {}
+
+
+def _ratio_history(numerators: list[float | None], denominators: list[float | None]) -> list[float | None]:
+    ratios: list[float | None] = []
+    for numerator, denominator in zip(numerators, denominators):
+        if numerator is None or denominator is None or denominator <= 0:
+            ratios.append(None)
+        else:
+            ratios.append(numerator / denominator)
+    return ratios
+
+
+def _column(rows: list[dict[str, Any]], *keys: str) -> list[float | None]:
+    values: list[float | None] = []
+    for row in rows:
+        number = None
+        for key in keys:
+            number = as_float(row.get(key))
+            if number is not None:
+                break
+        values.append(number)
+    return values
+
+
+def _column_first(rows: list[dict[str, Any]], *keys: str) -> float | None:
+    for value in _column(rows, *keys):
+        if value is not None:
+            return value
+    return None
 
 
 def _first_number(payload: dict[str, Any], *keys: str) -> float | None:

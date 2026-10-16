@@ -39,6 +39,14 @@ LINE_ITEMS: dict[str, tuple[str, ...]] = {
     "free_cash_flow": ("Free Cash Flow",),
     "operating_cash_flow": ("Operating Cash Flow", "Total Cash From Operating Activities"),
     "capital_expenditure": ("Capital Expenditure",),
+    "total_assets": ("Total Assets",),
+    "net_income": ("Net Income", "Net Income Common Stockholders"),
+    "retained_earnings": ("Retained Earnings",),
+    "gross_profit": ("Gross Profit",),
+    "long_term_debt": (
+        "Long Term Debt And Capital Lease Obligation",
+        "Long Term Debt",
+    ),
 }
 
 
@@ -68,6 +76,74 @@ def latest_line_item(frame: pd.DataFrame | None, names: tuple[str, ...] | list[s
             if number is not None:
                 return number
     return None
+
+
+def annual_column_values(frame: pd.DataFrame | None, names: tuple[str, ...] | list[str]) -> list[float | None]:
+    """One value per annual column, most recent first. Missing years stay None.
+
+    Keeping the blank years in place lets two lines from the same statement
+    be compared year by year. Dropping blanks would pair this year with an
+    older year.
+    """
+    statement = normalize_statement(frame)
+    if statement is None:
+        return []
+    index = {str(label).strip().lower(): label for label in statement.index}
+    label = next((index.get(name.strip().lower()) for name in names if name.strip().lower() in index), None)
+    if label is None:
+        return []
+    series = statement.loc[label]
+    values = series.tolist() if hasattr(series, "tolist") else [series]
+    return [as_float(value) for value in values]
+
+
+def quality_statement_fields(
+    balance: pd.DataFrame | None,
+    income: pd.DataFrame | None,
+    cashflow: pd.DataFrame | None,
+) -> dict[str, float | None | list[float | None]]:
+    """Annual lines used by the F-score, Altman Z, and return checks."""
+
+    def columns(frame: pd.DataFrame | None, key: str) -> list[float | None]:
+        return annual_column_values(frame, LINE_ITEMS[key])
+
+    def first(values: list[float | None]) -> float | None:
+        for value in values:
+            if value is not None:
+                return value
+        return None
+
+    assets = columns(balance, "total_assets")
+    equity = columns(balance, "equity")
+    current_assets = columns(balance, "current_assets")
+    current_liabilities = columns(balance, "current_liabilities")
+    ratios: list[float | None] = []
+    for asset_value, liability_value in zip(current_assets, current_liabilities):
+        if asset_value is None or liability_value is None or liability_value <= 0:
+            ratios.append(None)
+        else:
+            ratios.append(asset_value / liability_value)
+    return {
+        "total_assets": first(assets),
+        "total_assets_history": assets,
+        "total_equity": first(equity),
+        "equity_history": equity,
+        "retained_earnings": first(columns(balance, "retained_earnings")),
+        "long_term_debt": first(columns(balance, "long_term_debt")),
+        "long_term_debt_history": columns(balance, "long_term_debt"),
+        "total_debt_history": columns(balance, "total_debt"),
+        "cash_history": columns(balance, "cash"),
+        "current_ratio_history": ratios,
+        "shares_history": columns(balance, "shares"),
+        "net_income": first(columns(income, "net_income")),
+        "net_income_history": columns(income, "net_income"),
+        "revenue_history": columns(income, "revenue"),
+        "ebit_history": columns(income, "ebit"),
+        "gross_profit": first(columns(income, "gross_profit")),
+        "gross_profit_history": columns(income, "gross_profit"),
+        "operating_cash_flow": first(columns(cashflow, "operating_cash_flow")),
+        "operating_cash_flow_history": columns(cashflow, "operating_cash_flow"),
+    }
 
 
 def annual_series(frame: pd.DataFrame | None, names: tuple[str, ...] | list[str]) -> list[float]:
@@ -141,6 +217,24 @@ def assemble_fundamentals(
     enterprise_value: float | None = None,
     source: str = "yfinance",
     notes: list[str] | None = None,
+    net_income: float | None = None,
+    total_assets: float | None = None,
+    retained_earnings: float | None = None,
+    operating_cash_flow: float | None = None,
+    gross_profit: float | None = None,
+    long_term_debt: float | None = None,
+    net_income_history: list[float | None] | None = None,
+    total_assets_history: list[float | None] | None = None,
+    operating_cash_flow_history: list[float | None] | None = None,
+    revenue_history: list[float | None] | None = None,
+    ebit_history: list[float | None] | None = None,
+    gross_profit_history: list[float | None] | None = None,
+    long_term_debt_history: list[float | None] | None = None,
+    total_debt_history: list[float | None] | None = None,
+    cash_history: list[float | None] | None = None,
+    equity_history: list[float | None] | None = None,
+    current_ratio_history: list[float | None] | None = None,
+    shares_history: list[float | None] | None = None,
 ) -> StockFundamentals:
     """Normalize one vendor payload into the record the rest of the system uses."""
     notes = list(notes or [])
@@ -204,10 +298,33 @@ def assemble_fundamentals(
         debt_to_equity=debt_to_equity,
         average_volume=as_float(average_volume),
         enterprise_value=as_float(enterprise_value),
+        total_equity=equity,
+        net_income=as_float(net_income),
+        total_assets=as_float(total_assets),
+        retained_earnings=as_float(retained_earnings),
+        operating_cash_flow=as_float(operating_cash_flow),
+        gross_profit=as_float(gross_profit),
+        long_term_debt=as_float(long_term_debt),
+        net_income_history=_aligned(net_income_history),
+        total_assets_history=_aligned(total_assets_history),
+        operating_cash_flow_history=_aligned(operating_cash_flow_history),
+        revenue_history=_aligned(revenue_history),
+        ebit_history=_aligned(ebit_history),
+        gross_profit_history=_aligned(gross_profit_history),
+        long_term_debt_history=_aligned(long_term_debt_history),
+        total_debt_history=_aligned(total_debt_history),
+        cash_history=_aligned(cash_history),
+        equity_history=_aligned(equity_history),
+        current_ratio_history=_aligned(current_ratio_history),
+        shares_history=_aligned(shares_history),
         source=source,
         fetched_at=utcnow(),
         notes=notes,
     )
+
+
+def _aligned(values: list[float | None] | None) -> list[float | None]:
+    return [as_float(value) for value in (values or [])]
 
 
 def info_number(info: dict[str, Any], *keys: str) -> float | None:

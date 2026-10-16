@@ -5,6 +5,7 @@ from __future__ import annotations
 from src.config import ScoringWeights
 from src.data.models import StockFundamentals, as_float
 from src.screening.filters import ComputedMetrics
+from src.valuation.quality import QualityAssessment, assess_quality
 
 
 def margin_of_safety(intrinsic_value: float | None, price: float | None) -> float | None:
@@ -122,44 +123,38 @@ def _balance_unit(metrics: ComputedMetrics) -> float:
     return 0.6 * debt_score + 0.4 * current_score
 
 
-def _quality_unit(stock: StockFundamentals, metrics: ComputedMetrics) -> float:
-    score = 0.0
-    fcf = as_float(stock.free_cash_flow)
-    eps = as_float(stock.trailing_eps)
-    if fcf is not None and fcf > 0:
-        score += 0.4
-    if eps is not None and eps > 0:
-        score += 0.3
-    if metrics.current_ratio is not None and metrics.current_ratio >= 1.5:
-        score += 0.3
-    elif metrics.current_ratio is not None and metrics.current_ratio >= 1.0:
-        score += 0.15
-    return score
-
-
 def composite_score(
     stock: StockFundamentals,
     metrics: ComputedMetrics,
     median_mos: float | None,
     weights: ScoringWeights,
+    quality: QualityAssessment | None = None,
 ) -> float:
-    """Weighted score from 0 to 100. Weights are renormalized to sum to 1."""
+    """Weighted score from 0 to 100. Weights are renormalized to sum to 1.
+
+    The three default inputs are margin of safety, relative cheapness, and
+    quality. Relative cheapness is the percentile of P/E, P/B, and EV/EBIT
+    inside the stock's sector. A sector with fewer than five names uses the
+    industry instead. 0 is the cheapest name in that group. A group that is
+    still too small falls back to the absolute P/E, P/B, and EV/EBIT buckets.
+    A zero weight, including the optional balance-sheet weight, drops out of
+    the average.
+    """
     absolute = _cheap_absolute(metrics.pe, metrics.pb, metrics.ev_ebit)
     relative = _cheap_percentile(metrics)
-    if absolute is None and relative is None:
-        cheap = 0.0
-    elif absolute is None:
-        cheap = relative or 0.0
-    elif relative is None:
+    if relative is not None:
+        cheap = relative
+    elif absolute is not None:
         cheap = absolute
     else:
-        cheap = 0.5 * absolute + 0.5 * relative
+        cheap = 0.0
 
+    assessment = quality or assess_quality(stock)
     components = {
         "margin_of_safety": _mos_unit(median_mos),
         "cheapness": cheap,
         "balance_sheet": _balance_unit(metrics),
-        "quality": _quality_unit(stock, metrics),
+        "quality": _unit_interval(assessment.quality_score / 100),
     }
     weight_map = {
         "margin_of_safety": weights.margin_of_safety,
