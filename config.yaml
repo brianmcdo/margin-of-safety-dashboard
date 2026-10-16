@@ -1,0 +1,118 @@
+# Conservative defaults for a margin-of-safety screen.
+# This system ranks research candidates. It is not a trading system
+# and it is not investment advice.
+
+universe:
+  default: sample
+  cache_ttl_hours: 20
+  max_workers: 6
+
+fred:
+  series: DAAA
+  # Percent, not a decimal. 6.0 means a 6% AAA corporate yield.
+  fallback_aaa_yield: 6.0
+
+data:
+  # yfinance | fmp | auto (FMP when FMP_API_KEY is set, otherwise yfinance)
+  source: yfinance
+  fmp_api_key_env: FMP_API_KEY
+  sqlite_path: data/value_signals.db
+  request_timeout_seconds: 25
+
+screens:
+  enabled:
+    max_pe: true
+    max_pb: true
+    max_ev_ebit: true
+    max_debt_equity: true
+    min_current_ratio: true
+    positive_eps: true
+    positive_fcf: true
+    max_price_to_ncav: false
+    min_market_cap: true
+    min_avg_volume: true
+  thresholds:
+    max_pe: 15
+    max_pb: 1.5
+    max_ev_ebit: 10
+    max_debt_equity: 1.0
+    min_current_ratio: 1.5
+    max_price_to_ncav: 1.0
+    min_market_cap: 500000000
+    min_avg_volume: 200000
+    # absolute | sector_percentile
+    # sector_percentile keeps names in the cheapest slice of their sector,
+    # and falls back to max_pe when a sector has fewer than 5 observations.
+    pe_mode: absolute
+    max_pe_sector_percentile: 0.40
+  # A stock trading below NCAV can skip earnings and leverage filters.
+  # Liquidity floors still apply. NCAV already subtracts all liabilities.
+  deep_value_bypass: true
+
+valuation:
+  # Whole-number percent used by Graham's revised formula (5 means 5%).
+  graham_growth_percent: 5
+  max_graham_growth_percent: 15
+  # Caps the interest-rate-adjusted P/E so a very low bond yield cannot
+  # produce an absurdly large intrinsic value.
+  max_graham_implied_pe: 40
+  dcf:
+    years: 8
+    growth_rate: 0.03
+    discount_rate: 0.10
+    terminal_growth: 0.025
+    # Terminal value is scaled down when it would dominate the result.
+    max_terminal_share: 0.65
+    normalize_years: 3
+  ncav:
+    discount_receivables: 0.75
+    discount_inventory: 0.50
+  mos:
+    strong: 0.40
+    moderate: 0.25
+    minimum: 0.25
+
+scoring:
+  weights:
+    margin_of_safety: 0.50
+    cheapness: 0.25
+    balance_sheet: 0.15
+    quality: 0.10
+
+alerts:
+  console: true
+  email:
+    enabled: false
+    smtp_host: ""
+    smtp_port: 587
+    from_env: ALERT_EMAIL_FROM
+    password_env: ALERT_EMAIL_PASSWORD
+    username_env: ALERT_EMAIL_USER
+    to: []
+    use_tls: true
+
+commodity:
+  enabled: true
+  industry_keywords:
+    - oil & gas
+    - oil
+    - gas e&p
+    - gold
+    - silver
+    - copper
+    - mining
+    - coal
+    - uranium
+    - steel
+    - aluminum
+    - aluminium
+    - iron
+    - lithium
+    - metals
+  sensitivity_price_multipliers: [0.70, 0.85, 1.00, 1.15, 1.30]
+  sensitivity_discount_rates: [0.08, 0.10, 0.12]
+
+schedule:
+  day_of_week: mon-fri
+  hour: 7
+  minute: 0

@@ -1,0 +1,22 @@
+services:
+  dashboard:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      FMP_API_KEY: ${FMP_API_KEY:-}
+
+  scan:
+    build: .
+    profiles: ["scan"]
+    volumes:
+      - ./data:/app/data
+      - ./output:/app/output
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      FMP_API_KEY: ${FMP_API_KEY:-}
+    command: python -m src.main --universe sample --min-mos 0.25

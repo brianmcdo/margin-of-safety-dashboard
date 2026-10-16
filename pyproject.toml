@@ -1,0 +1,10 @@
+[project]
+name = "value-signals"
+version = "1.0.0"
+description = "Margin-of-safety screen, valuation, and signal system for equities."
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

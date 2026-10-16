@@ -1,0 +1,11 @@
+pandas>=2.2
+numpy>=1.26
+requests>=2.32
+yfinance>=0.2.54
+streamlit>=1.40
+pyyaml>=6.0
+pydantic>=2.9
+apscheduler>=3.10
+pytest>=8.3
+lxml>=5.3
+rich>=13.9
