@@ -12,10 +12,7 @@ fi
 
 case "$mode" in
     dashboard)
-        exec streamlit run src/dashboard/app.py \
-            --server.address=0.0.0.0 \
-            --server.port=8501 \
-            --server.headless=true
+        exec python -m src.api --host 0.0.0.0 --port 8501
         ;;
     scan)
         exec python -m src.main "$@"

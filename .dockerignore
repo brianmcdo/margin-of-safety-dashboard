@@ -1,4 +1,6 @@
 .venv
+web/node_modules
+web/dist
 .git
 .pytest_cache
 .mypy_cache

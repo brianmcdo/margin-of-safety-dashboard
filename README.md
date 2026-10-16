@@ -14,26 +14,38 @@ Docker starts the dashboard. The database, logs, and CSV files stay on your mach
 docker compose up --build
 ```
 
-Open [http://localhost:8501](http://localhost:8501). The page reads the latest saved snapshot. The first time, that snapshot does not exist yet, so run a scan in another terminal:
+Open [http://localhost:8501](http://localhost:8501). The page is a Shadcn interface over the latest saved snapshot. The first time, that snapshot does not exist yet, so run a scan in another terminal:
 
 ```bash
 docker compose --profile scan run --rm scan
 docker compose --profile scan run --rm scan --universe INTC,XOM,NEM --limit 3
 ```
 
-The scan uses `config.yaml` for the universe, the discount rate, the growth rate, and the thresholds. Edit that file and run the scan again. You do not rebuild the image to change those settings, because the file is mounted into the container.
+The image builds the Shadcn page, then serves it with the API on port 8501. A scan uses a smaller target of the same Dockerfile, so it does not compile the UI. Both commands read `config.yaml` for the universe, the discount rate, the growth rate, and the thresholds. Edit that file and run again. You do not rebuild the image to change those settings, because the file is mounted into the container. A UI change does require `docker compose up --build`.
 
 `FMP_API_KEY` in the environment is passed through when you want Financial Modeling Prep as a fallback. Leave it unset to use Yahoo Finance.
 
 ## Setup without Docker
 
-Python 3.11 or newer.
+Python 3.12 and Node 22.
 
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+cd web && npm install && npm run build && cd ..
+python -m src.api
 ```
+
+Open [http://127.0.0.1:8501](http://127.0.0.1:8501). The API serves the built page in `web/dist` and the JSON under `/api`. Rebuild `web/` after a UI change, then start the API again.
+
+For UI work, leave the API running and start Vite, which proxies `/api` to port 8501:
+
+```bash
+cd web && npm run dev
+```
+
+Vite is at [http://127.0.0.1:5173](http://127.0.0.1:5173).
 
 Optional email alerts. Email stays off until `alerts.email.enabled` is true in `config.yaml`.
 
@@ -51,7 +63,7 @@ python -m src.main --universe sp500 --min-mos 0.30 --min-quality 40
 python -m src.main --universe sample --min-mos 0.30 --min-quality 50 --signal strong
 python -m src.main --as-of 2024-01-15
 python -m src.main --schedule
-streamlit run src/dashboard/app.py
+python -m src.api
 pytest
 ```
 
@@ -61,7 +73,16 @@ The first sample run takes a few minutes because each name needs a price and thr
 
 The terminal shows the names that clear the filters, then a suggested basket. The table includes a News column: `Neg` when recent headlines were flagged. The CSV under `output/` contains every name that was valued, including rejects.
 
-The dashboard loads that saved snapshot. The sidebar filters the table, the charts, and the CSV. Oil, gold, and copper planning prices reprice the commodity table from the cached statements. They do not start a new fetch. The Historical page replays a stored snapshot. A limit of `0` on the scan form means the whole selected universe.
+## Dashboard
+
+The page in `web/` is a [shadcn/ui](https://ui.shadcn.com/) app (Vite, React, and Tailwind). Docker builds that page into the image. Locally, `python -m src.api` serves the last `npm run build`.
+
+Two tabs:
+
+- **Research** loads the latest saved snapshot. Filters for margin of safety, quality, market cap, sector, signal, commodity producers, and low-cost producers apply to the charts, the ranked table, and the CSV. A row opens the stock: reasons, valuation methods, a headline warning, and the commodity grid. Oil, gold, and copper planning prices on that card reprice the grid from cached statements. They do not start a fetch. The suggested basket sits under the table and uses the filtered ranking. **Run a scan** in the filter column writes a new snapshot. A limit of `0` means the whole selected universe.
+- **Historical** replays stored fundamentals and closes as of a date and shows 6-month and 1-year price returns. "Download missing closes from Yahoo" is off until you check it.
+
+Opening either tab reads SQLite. It does not request new market data.
 
 ## Example output
 
@@ -210,7 +231,7 @@ python -m src.main --as-of 2024-01-15 --fetch-prices
 
 `--fetch-prices` downloads daily closes from Yahoo from a few days before the date through today. The summary is the equal-weight 6-month and 1-year price return of the names that cleared the filters, next to the equal-weight return of every name valued that day. The benchmark ticker is shown when its closes are stored. A close counts only when it falls within `backtest.price_tolerance_days` of the horizon. There is no position size, rebalance, dividend, or trading cost.
 
-The same screen is on the dashboard's Historical page.
+The same screen is the Historical tab in the dashboard.
 
 ## Suggested basket
 

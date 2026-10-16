@@ -1,12 +1,15 @@
-# docker compose up --build
-# Dashboard: http://localhost:8501
-# A scan uses the same image and config.yaml:
-#   docker compose run --rm scan
-#   docker compose run --rm scan --universe INTC,XOM,NEM --limit 3
+# Build and open the Shadcn dashboard at http://localhost:8501
+#   docker compose up --build
+#
+# Run a scan with the same config.yaml. The scan image does not include the UI.
+#   docker compose --profile scan run --rm scan
+#   docker compose --profile scan run --rm scan --universe INTC,XOM,NEM --limit 3
 
 services:
   dashboard:
-    build: .
+    build:
+      context: .
+      target: dashboard
     ports:
       - "8501:8501"
     volumes:
@@ -22,7 +25,9 @@ services:
     restart: unless-stopped
 
   scan:
-    build: .
+    build:
+      context: .
+      target: runtime
     profiles: ["scan"]
     volumes:
       - ./data:/app/data
